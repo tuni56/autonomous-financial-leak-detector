@@ -1,0 +1,17 @@
+# Environment
+.env
+.venv/
+__pycache__/
+*.pyc
+
+# Terraform state (sensitive)
+infra/.terraform/
+infra/terraform.tfstate
+infra/terraform.tfstate.backup
+infra/.terraform.lock.hcl
+
+# Lambda build artifact
+infra/lambda_payload.zip
+
+# KMS policy (may contain account-specific ARNs)
+kms-policy.json
