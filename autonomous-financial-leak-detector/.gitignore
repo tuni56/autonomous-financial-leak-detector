@@ -1,5 +1,7 @@
 # Environment
 .env
+infra/fraud_detection/terraform.tfvars
+infra/fraud_detection/fraud_scorer.zip
 .venv/
 __pycache__/
 *.pyc

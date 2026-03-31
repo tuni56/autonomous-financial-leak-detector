@@ -1,6 +1,6 @@
 # --- Provider Configuration ---
 provider "aws" {
-  region = "us-east-2"
+  region = "us-east-1"
 }
 
 # --- Variables & Locals ---
@@ -51,7 +51,7 @@ resource "aws_iam_role_policy" "lambda_policy" {
       {
         Action   = "bedrock:InvokeModel"
         Effect   = "Allow"
-        Resource = "arn:aws:bedrock:us-east-2::foundation-model/anthropic.claude-3-5-sonnet-*"
+        Resource = "arn:aws:bedrock:us-east-1::foundation-model/anthropic.claude-3-5-sonnet-*"
       },
       {
         Action   = ["s3:GetObject", "s3:PutObject", "s3:ListBucket"]
@@ -89,7 +89,7 @@ resource "aws_lambda_function" "auditor" {
     variables = {
       AUDIT_REPORT_BUCKET = aws_s3_bucket.audit_reports.id
       MODEL_ID            = "anthropic.claude-3-5-sonnet-20240620-v1:0"
-      AWS_REGION_NAME     = "us-east-2"
+      AWS_REGION_NAME     = "us-east-1"
       SNS_TOPIC_ARN       = aws_sns_topic.audit_alerts.arn
       DLQ_URL             = aws_sqs_queue.dlq.url
     }
