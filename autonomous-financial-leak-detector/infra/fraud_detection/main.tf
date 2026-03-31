@@ -11,26 +11,49 @@ terraform {
   }
 }
 
+# ── Providers ─────────────────────────────────────────────────────────────────
 provider "aws" {
   region = var.aws_region
   default_tags { tags = local.tags }
 }
 
-# ─────────────────────────────────────────────
-# DATA INGESTION — Kinesis Data Stream (on-demand)
-# ─────────────────────────────────────────────
+# Billing metrics are only available in us-east-1 regardless of stack region
+provider "aws" {
+  alias  = "billing"
+  region = "us-east-1"
+  default_tags { tags = local.tags }
+}
+
+# ── Data ──────────────────────────────────────────────────────────────────────
+data "aws_caller_identity" "current" {}
+
+data "archive_file" "fraud_scorer" {
+  type        = "zip"
+  output_path = "${path.module}/fraud_scorer.zip"
+  source {
+    content  = file("${path.module}/../../src/lambdas/fraud_scorer.py")
+    filename = "fraud_scorer.py"
+  }
+}
+
+# ── Kinesis — On-Demand Data Stream ───────────────────────────────────────────
 resource "aws_kinesis_stream" "transactions" {
   name             = "afld-fraud-transactions"
+  retention_period = 24
+
   stream_mode_details {
     stream_mode = "ON_DEMAND"
   }
-  retention_period = 24
 }
 
-# ─────────────────────────────────────────────
-# IAM — Flink Application Role
-# ─────────────────────────────────────────────
-resource "aws_iam_role" "flink_role" {
+# ── S3 — Flink Checkpoint Storage ─────────────────────────────────────────────
+resource "aws_s3_bucket" "flink_checkpoints" {
+  bucket        = "afld-fraud-flink-checkpoints-${data.aws_caller_identity.current.account_id}"
+  force_destroy = true
+}
+
+# ── IAM — Managed Flink ───────────────────────────────────────────────────────
+resource "aws_iam_role" "flink" {
   name = "afld-fraud-flink-role"
 
   assume_role_policy = jsonencode({
@@ -43,19 +66,16 @@ resource "aws_iam_role" "flink_role" {
   })
 }
 
-resource "aws_iam_role_policy" "flink_policy" {
+resource "aws_iam_role_policy" "flink" {
   name = "afld-fraud-flink-policy"
-  role = aws_iam_role.flink_role.id
+  role = aws_iam_role.flink.id
 
   policy = jsonencode({
     Version = "2012-10-17"
     Statement = [
       {
         Effect = "Allow"
-        Action = [
-          "kinesis:GetRecords", "kinesis:GetShardIterator",
-          "kinesis:DescribeStream", "kinesis:ListShards"
-        ]
+        Action = ["kinesis:GetRecords", "kinesis:GetShardIterator", "kinesis:DescribeStream", "kinesis:ListShards"]
         Resource = aws_kinesis_stream.transactions.arn
       },
       {
@@ -77,65 +97,7 @@ resource "aws_iam_role_policy" "flink_policy" {
   })
 }
 
-# ─────────────────────────────────────────────
-# S3 — Flink Checkpoint Storage
-# ─────────────────────────────────────────────
-resource "aws_s3_bucket" "flink_checkpoints" {
-  bucket        = "afld-fraud-flink-checkpoints-${data.aws_caller_identity.current.account_id}"
-  force_destroy = true
-}
-
-data "aws_caller_identity" "current" {}
-
-# ─────────────────────────────────────────────
-# STATEFUL PROCESSING — Managed Flink Application
-# ─────────────────────────────────────────────
-resource "aws_kinesisanalyticsv2_application" "fraud_detector" {
-  name                   = "afld-fraud-detector"
-  runtime_environment    = "FLINK-1_18"
-  service_execution_role = aws_iam_role.flink_role.arn
-
-  application_configuration {
-    application_code_configuration {
-      code_content_type = "PLAINTEXT"
-      # Placeholder — replace with your compiled Flink JAR via S3 code_content_s3_location
-      code_content {
-        text_content = "# Replace with S3 JAR reference"
-      }
-    }
-
-    flink_application_configuration {
-      parallelism_configuration {
-        configuration_type = "CUSTOM"
-        parallelism        = 2
-        parallelism_per_kpu = 1
-        auto_scaling_enabled = false
-      }
-
-      checkpoint_configuration {
-        configuration_type        = "CUSTOM"
-        checkpointing_enabled     = true
-        checkpoint_interval       = 60000  # 60 seconds in ms
-        min_pause_between_checkpoints = 5000
-      }
-
-      monitoring_configuration {
-        configuration_type = "CUSTOM"
-        log_level          = "INFO"
-        metrics_level      = "APPLICATION"
-      }
-    }
-
-  }
-
-  # Kinesis source is wired inside the Flink application code (via KinesisConsumer).
-  # The IAM policy above grants the required GetRecords permissions.
-
-  cloudwatch_logging_options {
-    log_stream_arn = aws_cloudwatch_log_stream.flink.arn
-  }
-}
-
+# ── Managed Apache Flink ──────────────────────────────────────────────────────
 resource "aws_cloudwatch_log_group" "flink" {
   name              = "/aws/kinesisanalytics/afld-fraud-detector"
   retention_in_days = 7
@@ -146,10 +108,50 @@ resource "aws_cloudwatch_log_stream" "flink" {
   log_group_name = aws_cloudwatch_log_group.flink.name
 }
 
-# ─────────────────────────────────────────────
-# IAM — Lambda Fraud Scorer Role
-# ─────────────────────────────────────────────
-resource "aws_iam_role" "lambda_fraud_role" {
+resource "aws_kinesisanalyticsv2_application" "fraud_detector" {
+  name                   = "afld-fraud-detector"
+  runtime_environment    = "FLINK-1_18"
+  service_execution_role = aws_iam_role.flink.arn
+
+  application_configuration {
+    application_code_configuration {
+      code_content_type = "PLAINTEXT"
+      code_content {
+        # TODO: replace with s3_content_location once JAR is compiled
+        text_content = "placeholder"
+      }
+    }
+
+    flink_application_configuration {
+      parallelism_configuration {
+        configuration_type   = "CUSTOM"
+        parallelism          = 2
+        parallelism_per_kpu  = 1
+        auto_scaling_enabled = false
+      }
+
+      checkpoint_configuration {
+        configuration_type            = "CUSTOM"
+        checkpointing_enabled         = true
+        checkpoint_interval           = 60000 # ms
+        min_pause_between_checkpoints = 5000  # ms
+      }
+
+      monitoring_configuration {
+        configuration_type = "CUSTOM"
+        log_level          = "INFO"
+        metrics_level      = "APPLICATION"
+      }
+    }
+  }
+
+  cloudwatch_logging_options {
+    log_stream_arn = aws_cloudwatch_log_stream.flink.arn
+  }
+}
+
+# ── IAM — Lambda ──────────────────────────────────────────────────────────────
+resource "aws_iam_role" "lambda_fraud" {
   name = "afld-fraud-lambda-role"
 
   assume_role_policy = jsonencode({
@@ -162,17 +164,16 @@ resource "aws_iam_role" "lambda_fraud_role" {
   })
 }
 
-resource "aws_iam_role_policy" "lambda_fraud_policy" {
+resource "aws_iam_role_policy" "lambda_fraud" {
   name = "afld-fraud-lambda-policy"
-  role = aws_iam_role.lambda_fraud_role.id
+  role = aws_iam_role.lambda_fraud.id
 
   policy = jsonencode({
     Version = "2012-10-17"
     Statement = [
       {
-        # On-Demand Bedrock — no Provisioned Throughput ARN needed
-        Effect   = "Allow"
-        Action   = "bedrock:InvokeModel"
+        Effect = "Allow"
+        Action = "bedrock:InvokeModel"
         Resource = [
           "arn:aws:bedrock:${var.aws_region}::foundation-model/anthropic.claude-3-haiku-20240307-v1:0",
           "arn:aws:bedrock:${var.aws_region}::foundation-model/anthropic.claude-3-sonnet-20240229-v1:0"
@@ -192,32 +193,19 @@ resource "aws_iam_role_policy" "lambda_fraud_policy" {
   })
 }
 
-# ─────────────────────────────────────────────
-# AI INFERENCE — Lambda + Bedrock (On-Demand)
-# ─────────────────────────────────────────────
-data "archive_file" "fraud_scorer" {
-  type        = "zip"
-  output_path = "${path.module}/fraud_scorer.zip"
-  source {
-    content  = file("${path.module}/../../src/lambdas/fraud_scorer.py")
-    filename = "fraud_scorer.py"
-  }
-}
-
+# ── Lambda — Fraud Scorer ─────────────────────────────────────────────────────
 resource "aws_lambda_function" "fraud_scorer" {
-  function_name = "afld-fraud-scorer"
-  role          = aws_iam_role.lambda_fraud_role.arn
-  handler       = "fraud_scorer.handler"
-  runtime       = "python3.12"
-  timeout       = 29   # sub-30s for sync invocation from Flink
-  memory_size   = 512
-
+  function_name    = "afld-fraud-scorer"
+  role             = aws_iam_role.lambda_fraud.arn
+  handler          = "fraud_scorer.handler"
+  runtime          = "python3.12"
+  timeout          = 29  # keeps sync invocation from Flink within limits
+  memory_size      = 512
   filename         = data.archive_file.fraud_scorer.output_path
   source_code_hash = data.archive_file.fraud_scorer.output_base64sha256
 
   environment {
     variables = {
-      # Use Haiku by default (fastest + cheapest); swap to Sonnet for higher accuracy
       BEDROCK_MODEL_ID = "anthropic.claude-3-haiku-20240307-v1:0"
       SNS_TOPIC_ARN    = aws_sns_topic.fraud_alerts.arn
       AWS_REGION_NAME  = var.aws_region
@@ -230,65 +218,47 @@ resource "aws_cloudwatch_log_group" "lambda_fraud" {
   retention_in_days = 7
 }
 
-# ─────────────────────────────────────────────
-# ALERTING — SNS Topic + Email Subscription
-# ─────────────────────────────────────────────
+# ── SNS — Alerts ──────────────────────────────────────────────────────────────
 resource "aws_sns_topic" "fraud_alerts" {
   name = "afld-fraud-alerts"
 }
 
-resource "aws_sns_topic_subscription" "email_alert" {
+resource "aws_sns_topic_subscription" "fraud_alerts_email" {
   topic_arn = aws_sns_topic.fraud_alerts.arn
   protocol  = "email"
   endpoint  = var.alert_email
 }
 
-# ─────────────────────────────────────────────
-# COST GUARDRAIL — CloudWatch Billing Alarm ($15/day)
-# AWS billing metrics only exist in us-east-1
-# ─────────────────────────────────────────────
-provider "aws" {
-  alias  = "billing"
-  region = "us-east-1"
-  default_tags { tags = local.tags }
-}
-
+# ── SNS — Billing (us-east-1 only) ───────────────────────────────────────────
 resource "aws_sns_topic" "billing_alert" {
   provider = aws.billing
   name     = "afld-fraud-billing-alert"
 }
 
-resource "aws_sns_topic_subscription" "billing_email" {
+resource "aws_sns_topic_subscription" "billing_alert_email" {
   provider  = aws.billing
   topic_arn = aws_sns_topic.billing_alert.arn
   protocol  = "email"
   endpoint  = var.alert_email
 }
 
+# ── CloudWatch Alarms ─────────────────────────────────────────────────────────
 resource "aws_cloudwatch_metric_alarm" "daily_cost_guard" {
-  provider = aws.billing
-
+  provider            = aws.billing
   alarm_name          = "afld-fraud-daily-spend-15usd"
-  alarm_description   = "AFLD-Fraud stack estimated daily spend exceeded $15 USD"
+  alarm_description   = "AFLD-Fraud estimated daily spend exceeded $15 USD"
   comparison_operator = "GreaterThanThreshold"
   evaluation_periods  = 1
   metric_name         = "EstimatedCharges"
   namespace           = "AWS/Billing"
-  period              = 86400  # 24h — billing metrics update ~3x/day
+  period              = 86400
   statistic           = "Maximum"
   threshold           = 15
-
-  dimensions = {
-    Currency = "USD"
-  }
-
-  alarm_actions = [aws_sns_topic.billing_alert.arn]
-  treat_missing_data = "notBreaching"
+  treat_missing_data  = "notBreaching"
+  dimensions          = { Currency = "USD" }
+  alarm_actions       = [aws_sns_topic.billing_alert.arn]
 }
 
-# ─────────────────────────────────────────────
-# OPERATIONAL ALARMS
-# ─────────────────────────────────────────────
 resource "aws_cloudwatch_metric_alarm" "lambda_errors" {
   alarm_name          = "afld-fraud-scorer-errors"
   comparison_operator = "GreaterThanThreshold"
@@ -299,9 +269,7 @@ resource "aws_cloudwatch_metric_alarm" "lambda_errors" {
   statistic           = "Sum"
   threshold           = 0
   alarm_actions       = [aws_sns_topic.fraud_alerts.arn]
-  dimensions = {
-    FunctionName = aws_lambda_function.fraud_scorer.function_name
-  }
+  dimensions          = { FunctionName = aws_lambda_function.fraud_scorer.function_name }
 }
 
 resource "aws_cloudwatch_metric_alarm" "kinesis_iterator_age" {
@@ -315,7 +283,5 @@ resource "aws_cloudwatch_metric_alarm" "kinesis_iterator_age" {
   statistic           = "Maximum"
   threshold           = 30000
   alarm_actions       = [aws_sns_topic.fraud_alerts.arn]
-  dimensions = {
-    StreamName = aws_kinesis_stream.transactions.name
-  }
+  dimensions          = { StreamName = aws_kinesis_stream.transactions.name }
 }
