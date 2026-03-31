@@ -1,8 +1,9 @@
 # AFLD Deployment Guide
 ## Autonomous Financial Leak Detector — AWS Production Setup
 
-> Target audience: Small & Medium Fintech businesses  
-> Stack: Bedrock · Lambda · S3 · SQS · SNS · CloudWatch · Terraform
+> **Region:** `us-east-1`  
+> **Stack A:** AFLD Audit Engine (S3 → Lambda → Bedrock → SNS/SQS)  
+> **Stack B:** Derecho Viejo — Real-Time Fraud Detection (Kinesis → Flink → Lambda → Bedrock)
 
 ---
 
@@ -12,11 +13,10 @@
 |------|---------|---------|
 | AWS CLI | ≥ 2.x | Auth & resource management |
 | Terraform | ≥ 1.5 | Infrastructure provisioning |
-| Python | 3.11+ | Lambda runtime |
+| Python | 3.11+ | Lambda runtime & scripts |
 | uv | latest | Dependency management |
 
 ```bash
-# Verify all tools
 aws --version && terraform --version && python3 --version && uv --version
 ```
 
@@ -25,266 +25,197 @@ aws --version && terraform --version && python3 --version && uv --version
 ## Step 1 — AWS Account Setup
 
 ### 1.1 Enable Bedrock Model Access
-Claude 3.5 Sonnet must be explicitly enabled in your AWS account.
 
 ```
 AWS Console → Amazon Bedrock → Model access → Request access
-→ Select: Anthropic Claude 3.5 Sonnet
-→ Region: us-east-2 (Ohio)
+→ Enable: Claude 3.5 Sonnet  (Audit Engine)
+→ Enable: Claude 3 Haiku     (Fraud Scorer — default)
+→ Enable: Claude 3 Sonnet    (Fraud Scorer — optional upgrade)
+→ Region: us-east-1
 ```
 
-> ⚠️ This is a manual step — Terraform cannot automate model access approval.
+> ⚠️ Manual step — Terraform cannot automate model access approval.
 
-### 1.2 Configure AWS CLI credentials
+### 1.2 Configure AWS CLI
 
 ```bash
 aws configure
-# AWS Access Key ID: <your-key>
-# AWS Secret Access Key: <your-secret>
-# Default region: us-east-2
-# Default output format: json
-```
+# Default region: us-east-1
 
-Verify access:
-```bash
-aws sts get-caller-identity
-aws bedrock list-foundation-models --region us-east-2 --query 'modelSummaries[?modelId==`anthropic.claude-3-5-sonnet-20240620-v1:0`]'
+aws sts get-caller-identity  # verify
 ```
 
 ---
 
-## Step 2 — Package the Lambda
+## Stack A — AFLD Audit Engine
 
-The Lambda ZIP must include your source code and dependencies.
+### Deploy
 
 ```bash
-# From project root
+# Package Lambda
 pip install boto3 loguru pydantic -t lambda_package/
 cp -r src/ lambda_package/
 cd lambda_package && zip -r ../infra/lambda_payload.zip . && cd ..
-```
 
-Verify the ZIP contains the correct handler path:
-```bash
-unzip -l infra/lambda_payload.zip | grep auditor_handler
-# Expected: src/lambdas/auditor_handler.py
-```
-
----
-
-## Step 3 — Deploy Infrastructure with Terraform
-
-```bash
+# Deploy
 cd infra
-
-# Initialize providers
 terraform init
-
-# Preview what will be created
 terraform plan
-
-# Deploy (approx. 2-3 minutes)
 terraform apply -auto-approve
+terraform output
 ```
 
-### What gets created:
+### Resources created
 
 | Resource | Name | Purpose |
 |----------|------|---------|
-| S3 Bucket | `afld-transactions-landing-*` | Incoming transaction files |
-| S3 Bucket | `afld-audit-reports-*` | AI-generated audit reports |
+| S3 | `afld-transactions-landing-*` | Incoming transaction files |
+| S3 | `afld-audit-reports-*` | AI-generated audit reports |
 | Lambda | `afld-audit-engine-handler` | Core AI analysis engine |
-| SNS Topic | `afld-audit-engine-audit-alerts` | Real-time alert broadcast |
-| SQS Queue | `afld-audit-engine-alerts-queue` | Alert consumer queue |
+| SNS | `afld-audit-engine-audit-alerts` | Alert broadcast |
+| SQS | `afld-audit-engine-alerts-queue` | Alert consumer queue |
 | SQS DLQ | `afld-audit-engine-dlq` | Failed event recovery |
-| IAM Role | `afld-audit-engine-lambda-role` | Least-privilege permissions |
+| CloudWatch | Lambda errors + DLQ alarms | Observability |
 
-### Capture outputs:
+### Test
+
 ```bash
-terraform output
-# Save these values — you'll need them for testing
-```
-
----
-
-## Step 4 — Add CloudWatch Monitoring
-
-Terraform doesn't include CloudWatch yet. Add this to `infra/main.tf`:
-
-```hcl
-# CloudWatch Log Group (explicit, with retention)
-resource "aws_cloudwatch_log_group" "lambda_logs" {
-  name              = "/aws/lambda/${aws_lambda_function.auditor.function_name}"
-  retention_in_days = 30
-}
-
-# Alarm: Lambda errors > 0 in 5 minutes
-resource "aws_cloudwatch_metric_alarm" "lambda_errors" {
-  alarm_name          = "${var.project_name}-lambda-errors"
-  comparison_operator = "GreaterThanThreshold"
-  evaluation_periods  = 1
-  metric_name         = "Errors"
-  namespace           = "AWS/Lambda"
-  period              = 300
-  statistic           = "Sum"
-  threshold           = 0
-  alarm_description   = "Lambda audit engine threw an error"
-  alarm_actions       = [aws_sns_topic.audit_alerts.arn]
-
-  dimensions = {
-    FunctionName = aws_lambda_function.auditor.function_name
-  }
-}
-
-# Alarm: DLQ has messages (means transactions failed processing)
-resource "aws_cloudwatch_metric_alarm" "dlq_messages" {
-  alarm_name          = "${var.project_name}-dlq-not-empty"
-  comparison_operator = "GreaterThanThreshold"
-  evaluation_periods  = 1
-  metric_name         = "ApproximateNumberOfMessagesVisible"
-  namespace           = "AWS/SQS"
-  period              = 60
-  statistic           = "Sum"
-  threshold           = 0
-  alarm_description   = "Transactions are failing — check DLQ"
-  alarm_actions       = [aws_sns_topic.audit_alerts.arn]
-
-  dimensions = {
-    QueueName = aws_sqs_queue.dlq.name
-  }
-}
-```
-
-Apply the update:
-```bash
-terraform apply -auto-approve
-```
-
----
-
-## Step 5 — Subscribe to Alerts (Email / Slack)
-
-### Email alerts:
-```bash
-aws sns subscribe \
-  --topic-arn $(terraform output -raw sns_topic_arn) \
-  --protocol email \
-  --notification-endpoint your-team@company.com \
-  --region us-east-2
-```
-Check your inbox and confirm the subscription.
-
-### Slack alerts (via webhook):
-```bash
-aws sns subscribe \
-  --topic-arn $(terraform output -raw sns_topic_arn) \
-  --protocol https \
-  --notification-endpoint https://hooks.slack.com/services/YOUR/WEBHOOK/URL \
-  --region us-east-2
-```
-
----
-
-## Step 6 — End-to-End Test
-
-### 6.1 Inject a suspicious transaction:
-```bash
-# Get the landing bucket name
 BUCKET=$(cd infra && terraform output -raw s3_landing_bucket)
-
-# Upload a test transaction (fraud scenario)
 aws s3 cp data/TX_FRAUD_03.json s3://$BUCKET/TX_FRAUD_03.json
-```
 
-### 6.2 Watch Lambda execution in real time:
-```bash
+# Watch logs
 FUNCTION=$(cd infra && terraform output -raw lambda_function_name)
+aws logs tail /aws/lambda/$FUNCTION --follow
 
-aws logs tail /aws/lambda/$FUNCTION --follow --region us-east-2
-```
-
-### 6.3 Check the audit report:
-```bash
+# Read report
 REPORT_BUCKET=$(cd infra && terraform output -raw s3_audit_bucket)
-
-aws s3 ls s3://$REPORT_BUCKET/reports/ --region us-east-2
+aws s3 ls s3://$REPORT_BUCKET/reports/
 aws s3 cp s3://$REPORT_BUCKET/reports/<report-id>.json - | python3 -m json.tool
 ```
 
-### 6.4 Verify SNS alert was published:
-```bash
-SQS_URL=$(cd infra && terraform output -raw sqs_alerts_queue_url)
+---
 
-aws sqs receive-message --queue-url $SQS_URL --region us-east-2
+## Stack B — Derecho Viejo (Real-Time Fraud Detection)
+
+### Deploy
+
+```bash
+cd infra/fraud_detection
+cp terraform.tfvars.example terraform.tfvars
+# Edit terraform.tfvars — set alert_email
+
+terraform init
+terraform plan
+terraform apply -auto-approve
+```
+
+Confirm the SNS email subscription (check inbox after apply).
+
+### Resources created
+
+| Resource | Name | Notes |
+|----------|------|-------|
+| Kinesis | `afld-fraud-transactions` | ON_DEMAND, 24h retention |
+| Managed Flink | `afld-fraud-detector` | Flink 1.18, parallelism=2, checkpoint 60s |
+| S3 | `afld-fraud-flink-checkpoints-<account>` | Flink state storage |
+| Lambda | `afld-fraud-scorer` | Python 3.12, 512MB, Bedrock On-Demand |
+| SNS | `afld-fraud-alerts` | FRAUD/SUSPICIOUS verdicts + Lambda errors |
+| CloudWatch | 3 alarms | Lambda errors, Kinesis iterator age, $15/day spend |
+
+### Test — direct Lambda invocation
+
+```bash
+aws lambda invoke \
+  --function-name afld-fraud-scorer \
+  --payload '{"transaction_id":"TX-001","amount":9999.99,"user_id":"new_user_42","merchant":"UNKNOWN_INTL","country":"XX"}' \
+  --cli-binary-format raw-in-base64-out \
+  response.json && cat response.json
+```
+
+Expected:
+```json
+{"verdict": "FRAUD", "confidence": 0.97, "reason": "High-value transaction to unknown international merchant from a new user account."}
+```
+
+### Swap Bedrock model (no infra change needed)
+
+```bash
+# Upgrade to Sonnet for higher accuracy
+aws lambda update-function-configuration \
+  --function-name afld-fraud-scorer \
+  --environment "Variables={BEDROCK_MODEL_ID=anthropic.claude-3-sonnet-20240229-v1:0,SNS_TOPIC_ARN=<arn>,AWS_REGION_NAME=us-east-1}"
 ```
 
 ---
 
-## Step 7 — Run the Streamlit Dashboard (Optional)
+## Architecture
+
+```
+── Stack A: Audit Engine ──────────────────────────────────────────────
+
+[Fintech App]
+     │ PUT transaction.json
+     ▼
+  S3 Landing ──trigger──▶ Lambda Auditor ──InvokeModel──▶ Bedrock (Claude 3.5 Sonnet)
+                                │                                │
+                                │◀───────── AuditResult ─────────┘
+                                │
+                    ┌───────────┴───────────┐
+                    ▼                       ▼
+               S3 Reports              SNS Alerts ──▶ SQS / Email
+                                           │
+                                    (on failure) ──▶ SQS DLQ
+
+
+── Stack B: Derecho Viejo ─────────────────────────────────────────────
+
+[Transaction Producer]
+     │ PUT record
+     ▼
+  Kinesis (ON_DEMAND) ──▶ Managed Flink (p=2, ckpt 60s) ──▶ Lambda fraud_scorer
+                                │                                    │
+                           S3 Checkpoints              Bedrock (Claude 3 Haiku)
+                                                                     │
+                                                    FRAUD/SUSPICIOUS ──▶ SNS ──▶ Email
+                                                                     │
+                                                              CloudWatch Alarms
+                                                         (errors · iterator age · $15/day)
+```
+
+---
+
+## Cost Estimate (Staging-Demo scale)
+
+| Service | Stack A | Stack B |
+|---------|---------|---------|
+| Lambda | ~$0.02 | ~$0.02 |
+| Bedrock (Haiku/Sonnet) | ~$15–25/mo | ~$5–10/mo |
+| S3 | ~$0.50 | ~$0.50 |
+| Kinesis ON_DEMAND | — | ~$0.08/GB |
+| Managed Flink (2 KPU) | — | ~$0.11/KPU-hr |
+| SNS + SQS | < $1 | < $1 |
+
+Cost alarm fires at **$15/day** for Stack B.
+
+---
+
+## Optional — Streamlit Dashboard
 
 ```bash
-# From project root
 uv run streamlit run scripts/audit_dashboard.py
-# Opens at http://localhost:8501
+# http://localhost:8501
 ```
-
----
-
-## Architecture Flow
-
-```
-[Fintech App / Payment Gateway]
-         │
-         │  PUT transaction JSON
-         ▼
-  ┌─────────────┐
-  │  S3 Landing │  ← afld-transactions-landing-*
-  └──────┬──────┘
-         │ S3 Event Trigger
-         ▼
-  ┌─────────────────────┐
-  │   Lambda Auditor    │  ← Python 3.12, 512MB, 30s timeout
-  │  + Bedrock Claude   │  ← Claude 3.5 Sonnet behavioral analysis
-  └──────┬──────────────┘
-         │
-    ┌────┴────┐
-    │         │
-    ▼         ▼
-  S3 Report  SNS Alert
-  (JSON)     │
-             ├──→ SQS Alerts Queue  ← your app consumes this
-             ├──→ Email / Slack
-             └──→ CloudWatch Alarm (on error)
-                        │
-                        ▼
-                   SQS DLQ  ← failed transactions for manual review
-```
-
----
-
-## Business Value for SMB Fintech
-
-| Scenario | Without AFLD | With AFLD |
-|----------|-------------|-----------|
-| Duplicate charge detection | Manual review, days later | Flagged in < 5 seconds |
-| Off-hours transaction spike | Noticed in monthly report | Real-time SNS alert |
-| New merchant category anomaly | Missed entirely | Behavioral AI flags it |
-| Failed audit trail | Spreadsheets | Immutable S3 JSON reports |
-| Compliance evidence | Manual export | Auto-generated per transaction |
-
-**Cost estimate for SMB scale (10K transactions/month):**
-- Lambda: ~$0.02
-- Bedrock (Claude 3.5 Sonnet): ~$15–25 (input/output tokens)
-- S3: ~$0.50
-- SNS + SQS: < $1
-- **Total: ~$20–30/month** for full AI-powered fraud detection
 
 ---
 
 ## Teardown
 
 ```bash
+# Stack A
 cd infra && terraform destroy -auto-approve
+
+# Stack B
+cd infra/fraud_detection && terraform destroy -auto-approve
 ```
 
-> All S3 buckets have `force_destroy = true` — data will be permanently deleted.
+> Both stacks use `force_destroy = true` on S3 — all data will be permanently deleted.
