@@ -46,7 +46,7 @@ with Diagram(
 ):
     producer = User("Transaction\nProducer")
 
-    with Cluster("AWS — us-east-1", graph_attr=CLUSTER_STYLE):
+    with Cluster("AWS — us-east-2", graph_attr=CLUSTER_STYLE):
 
         with Cluster("Ingestion", graph_attr=CLUSTER_STYLE):
             kinesis = KinesisDataStreams("Kinesis\nON_DEMAND")

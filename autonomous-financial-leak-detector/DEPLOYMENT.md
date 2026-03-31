@@ -1,7 +1,7 @@
 # AFLD Deployment Guide
 ## Autonomous Financial Leak Detector — AWS Production Setup
 
-> **Region:** `us-east-1`  
+> **Region:** `us-east-2`  
 > **Stack A:** AFLD Audit Engine (S3 → Lambda → Bedrock → SNS/SQS)  
 > **Stack B:** Derecho Viejo — Real-Time Fraud Detection (Kinesis → Flink → Lambda → Bedrock)
 
@@ -31,7 +31,7 @@ AWS Console → Amazon Bedrock → Model access → Request access
 → Enable: Claude 3.5 Sonnet  (Audit Engine)
 → Enable: Claude 3 Haiku     (Fraud Scorer — default)
 → Enable: Claude 3 Sonnet    (Fraud Scorer — optional upgrade)
-→ Region: us-east-1
+→ Region: us-east-2
 ```
 
 > ⚠️ Manual step — Terraform cannot automate model access approval.
@@ -40,7 +40,7 @@ AWS Console → Amazon Bedrock → Model access → Request access
 
 ```bash
 aws configure
-# Default region: us-east-1
+# Default region: us-east-2
 
 aws sts get-caller-identity  # verify
 ```
@@ -143,7 +143,7 @@ Expected:
 # Upgrade to Sonnet for higher accuracy
 aws lambda update-function-configuration \
   --function-name afld-fraud-scorer \
-  --environment "Variables={BEDROCK_MODEL_ID=anthropic.claude-3-sonnet-20240229-v1:0,SNS_TOPIC_ARN=<arn>,AWS_REGION_NAME=us-east-1}"
+  --environment "Variables={BEDROCK_MODEL_ID=anthropic.claude-3-sonnet-20240229-v1:0,SNS_TOPIC_ARN=<arn>,AWS_REGION_NAME=us-east-2}"
 ```
 
 ---

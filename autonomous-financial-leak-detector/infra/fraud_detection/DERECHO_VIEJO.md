@@ -1,7 +1,7 @@
 # Derecho Viejo — Real-Time Fraud Detection Stack
 
 **Project:** AFLD-Fraud | **Owner:** Rocio-Distinguished | **Environment:** Staging-Demo  
-**Region:** `us-east-1`
+**Region:** `us-east-2`
 
 ---
 
@@ -54,7 +54,7 @@ Amazon Bedrock — Claude 3 Haiku (On-Demand)
 ```bash
 aws lambda update-function-configuration \
   --function-name afld-fraud-scorer \
-  --environment "Variables={BEDROCK_MODEL_ID=anthropic.claude-3-sonnet-20240229-v1:0,SNS_TOPIC_ARN=<arn>,AWS_REGION_NAME=us-east-1}"
+  --environment "Variables={BEDROCK_MODEL_ID=anthropic.claude-3-sonnet-20240229-v1:0,SNS_TOPIC_ARN=<arn>,AWS_REGION_NAME=us-east-2}"
 ```
 
 - Provisioned Throughput is **not used** — zero idle cost during demo.
@@ -144,4 +144,4 @@ The Kinesis source is configured inside the Flink app via `FlinkKinesisConsumer`
 
 | Date | Change |
 |---|---|
-| 2026-03-31 | Migrated all resources from `us-east-2` → `us-east-1` (Bedrock model availability + billing alarm requirement) |
+| 2026-03-31 | Region: us-east-2 (Ohio) — primary stack region
