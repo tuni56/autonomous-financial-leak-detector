@@ -255,3 +255,56 @@ output "s3_audit_bucket" {
 output "lambda_function_name" {
   value = aws_lambda_function.auditor.function_name
 }
+
+# --- Slack Notifier Lambda ---
+
+variable "slack_webhook_url" {
+  description = "Slack Incoming Webhook URL"
+  type        = string
+  sensitive   = true
+}
+
+data "archive_file" "slack_notifier" {
+  type        = "zip"
+  output_path = "${path.module}/slack_notifier.zip"
+  source {
+    content  = file("${path.module}/../src/lambdas/slack_notifier.py")
+    filename = "slack_notifier.py"
+  }
+}
+
+resource "aws_lambda_function" "slack_notifier" {
+  function_name    = "${var.project_name}-slack-notifier"
+  role             = aws_iam_role.lambda_role.arn
+  handler          = "slack_notifier.handler"
+  runtime          = "python3.12"
+  timeout          = 10
+  memory_size      = 128
+  filename         = data.archive_file.slack_notifier.output_path
+  source_code_hash = data.archive_file.slack_notifier.output_base64sha256
+
+  environment {
+    variables = {
+      SLACK_WEBHOOK_URL = var.slack_webhook_url
+    }
+  }
+}
+
+resource "aws_cloudwatch_log_group" "slack_notifier_logs" {
+  name              = "/aws/lambda/${aws_lambda_function.slack_notifier.function_name}"
+  retention_in_days = 7
+}
+
+resource "aws_lambda_permission" "sns_invoke_slack" {
+  statement_id  = "AllowSNSInvoke"
+  action        = "lambda:InvokeFunction"
+  function_name = aws_lambda_function.slack_notifier.function_name
+  principal     = "sns.amazonaws.com"
+  source_arn    = aws_sns_topic.audit_alerts.arn
+}
+
+resource "aws_sns_topic_subscription" "slack_subscription" {
+  topic_arn = aws_sns_topic.audit_alerts.arn
+  protocol  = "lambda"
+  endpoint  = aws_lambda_function.slack_notifier.arn
+}
